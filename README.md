@@ -19,8 +19,6 @@ Windowsのタスクバーに、Codexの5時間枠・週次枠の残量とリセ�
 - 定期更新、手動更新、Windows起動時の自動起動
 - 管理者権限、ブラウザのCookie、独自のログイン操作は不要
 
-![Screenshot](.github/animation.gif)
-
 ## 必要環境
 
 - Windows 10またはWindows 11
