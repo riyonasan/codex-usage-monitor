@@ -8,6 +8,10 @@ Windowsのタスクバーに、Codexの5時間枠・週次枠の残量とリセ�
 > [!IMPORTANT]
 > 非公式のコミュニティ製アプリです。OpenAIによる提供、承認、提携を受けた製品ではありません。
 
+## スクリーンショット
+
+![Codex Usage Monitorの表示例](.github/codex-usage-monitor-screenshot.png)
+
 ## 特長
 
 - 5時間枠と7日枠をタスクバー内に2行で常時表示
