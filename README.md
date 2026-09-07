@@ -8,9 +8,6 @@ Windowsのタスクバーに、Codexの5時間枠・週次枠の残量とリセ�
 > [!IMPORTANT]
 > 非公式のコミュニティ製アプリです。OpenAIによる提供、承認、提携を受けた製品ではありません。
 
-## スクリーンショット
-
-![Codex Usage Monitorの表示例](.github/codex-usage-monitor-screenshot.png)
 
 ## 特長
 
@@ -22,6 +19,8 @@ Windowsのタスクバーに、Codexの5時間枠・週次枠の残量とリセ�
 - 最近の消費ペースを基に、使い切る可能性が高い場合はゲージ色で警告
 - 定期更新、手動更新、Windows起動時の自動起動
 - 管理者権限、ブラウザのCookie、独自のログイン操作は不要
+  
+![Codex Usage Monitorの表示例](.github/codex-usage-monitor-screenshot.png)
 
 ## 必要環境
 
