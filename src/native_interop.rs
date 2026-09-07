@@ -1,7 +1,9 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{BOOL, FILETIME, HWND, LPARAM, RECT, SYSTEMTIME};
+use windows::Win32::Devices::Display::*;
+use windows::Win32::Foundation::{BOOL, ERROR_SUCCESS, FILETIME, HWND, LPARAM, RECT, SYSTEMTIME};
+use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows::Win32::UI::Shell::{SHAppBarMessage, ABM_GETTASKBARPOS, APPBARDATA};
@@ -47,10 +49,147 @@ pub fn system_time_to_local(value: SystemTime) -> Option<SYSTEMTIME> {
     Some(local)
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct TaskbarWindow {
     pub hwnd: HWND,
     pub rect: RECT,
+    /// Stable monitor identity used for persisted selection. The display
+    /// device instance id is preferred, with the monitor device name as a
+    /// safe fallback when Windows does not provide one.
+    pub monitor_id: String,
+    pub device_name: String,
+    pub display_name: String,
+    pub display_name_source: &'static str,
+    pub is_primary: bool,
+}
+
+fn utf16_string(values: &[u16]) -> String {
+    let len = values
+        .iter()
+        .position(|value| *value == 0)
+        .unwrap_or(values.len());
+    String::from_utf16_lossy(&values[..len])
+}
+
+/// Query Windows' active display configuration for the model/friendly name
+/// associated with a GDI display name such as `\\.\DISPLAY2`.
+fn display_config_friendly_name(device_name: &str) -> Option<String> {
+    unsafe {
+        let mut path_count = 0u32;
+        let mut mode_count = 0u32;
+        if GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut path_count, &mut mode_count)
+            != ERROR_SUCCESS
+            || path_count == 0
+        {
+            return None;
+        }
+
+        let mut paths = vec![DISPLAYCONFIG_PATH_INFO::default(); path_count as usize];
+        let mut modes = vec![DISPLAYCONFIG_MODE_INFO::default(); mode_count as usize];
+        let status = QueryDisplayConfig(
+            QDC_ONLY_ACTIVE_PATHS,
+            &mut path_count,
+            paths.as_mut_ptr(),
+            &mut mode_count,
+            modes.as_mut_ptr(),
+            None,
+        );
+        if status != ERROR_SUCCESS {
+            return None;
+        }
+
+        for path in paths.into_iter().take(path_count as usize) {
+            let mut source = DISPLAYCONFIG_SOURCE_DEVICE_NAME {
+                header: DISPLAYCONFIG_DEVICE_INFO_HEADER {
+                    r#type: DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME,
+                    size: std::mem::size_of::<DISPLAYCONFIG_SOURCE_DEVICE_NAME>() as u32,
+                    adapterId: path.sourceInfo.adapterId,
+                    id: path.sourceInfo.id,
+                },
+                ..Default::default()
+            };
+            if DisplayConfigGetDeviceInfo(&mut source.header) != ERROR_SUCCESS.0 as i32
+                || utf16_string(&source.viewGdiDeviceName) != device_name
+            {
+                continue;
+            }
+
+            let mut target = DISPLAYCONFIG_TARGET_DEVICE_NAME {
+                header: DISPLAYCONFIG_DEVICE_INFO_HEADER {
+                    r#type: DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME,
+                    size: std::mem::size_of::<DISPLAYCONFIG_TARGET_DEVICE_NAME>() as u32,
+                    adapterId: path.targetInfo.adapterId,
+                    id: path.targetInfo.id,
+                },
+                ..Default::default()
+            };
+            if DisplayConfigGetDeviceInfo(&mut target.header) == ERROR_SUCCESS.0 as i32 {
+                let name = utf16_string(&target.monitorFriendlyDeviceName);
+                if !name.is_empty() {
+                    return Some(name);
+                }
+            }
+        }
+        None
+    }
+}
+
+fn monitor_identity_for_rect(rect: RECT) -> Option<(String, String, String, &'static str, bool)> {
+    unsafe {
+        let monitor = MonitorFromRect(&rect, MONITOR_DEFAULTTONEAREST);
+        if monitor.is_invalid() {
+            return None;
+        }
+
+        let mut info = MONITORINFOEXW {
+            monitorInfo: MONITORINFO {
+                cbSize: std::mem::size_of::<MONITORINFOEXW>() as u32,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        if !GetMonitorInfoW(monitor, &mut info.monitorInfo as *mut MONITORINFO).as_bool() {
+            return None;
+        }
+
+        let device_name = utf16_string(&info.szDevice);
+
+        let mut display = DISPLAY_DEVICEW {
+            cb: std::mem::size_of::<DISPLAY_DEVICEW>() as u32,
+            ..Default::default()
+        };
+        let mut display_name = String::new();
+        let display_id =
+            if EnumDisplayDevicesW(PCWSTR::from_raw(info.szDevice.as_ptr()), 0, &mut display, 0)
+                .as_bool()
+            {
+                display_name = utf16_string(&display.DeviceString);
+                utf16_string(&display.DeviceID)
+            } else {
+                String::new()
+            };
+
+        let monitor_id = if display_id.is_empty() {
+            device_name.clone()
+        } else {
+            display_id
+        };
+        let (display_name, display_name_source) =
+            if let Some(name) = display_config_friendly_name(&device_name) {
+                (name, "DisplayConfig")
+            } else if !display_name.is_empty() {
+                (display_name, "DeviceString")
+            } else {
+                (device_name.clone(), "GdiDeviceName")
+            };
+        Some((
+            monitor_id,
+            device_name,
+            display_name,
+            display_name_source,
+            (info.monitorInfo.dwFlags & MONITORINFOF_PRIMARY) != 0,
+        ))
+    }
 }
 
 pub fn find_taskbars() -> Vec<TaskbarWindow> {
@@ -62,7 +201,24 @@ pub fn find_taskbars() -> Vec<TaskbarWindow> {
             let class_name = String::from_utf16_lossy(&class_name[..len as usize]);
             if class_name == "Shell_TrayWnd" || class_name == "Shell_SecondaryTrayWnd" {
                 if let Some(rect) = get_taskbar_rect(hwnd).or_else(|| get_window_rect_safe(hwnd)) {
-                    taskbars.push(TaskbarWindow { hwnd, rect });
+                    if let Some((
+                        monitor_id,
+                        device_name,
+                        display_name,
+                        display_name_source,
+                        is_primary,
+                    )) = monitor_identity_for_rect(rect)
+                    {
+                        taskbars.push(TaskbarWindow {
+                            hwnd,
+                            rect,
+                            monitor_id,
+                            device_name,
+                            display_name,
+                            display_name_source,
+                            is_primary,
+                        });
+                    }
                 }
             }
         }

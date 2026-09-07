@@ -1620,7 +1620,7 @@ pub fn format_line(
         return format_simplified_chinese_line(section, window);
     }
 
-    let pct = format!("{:.0}%", section.percentage);
+    let pct = format!("{:.0}%", remaining_percentage(section.percentage));
     let cd = format_countdown(section.resets_at, strings);
     if cd.is_empty() {
         pct

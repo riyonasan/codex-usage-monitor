@@ -1,13 +1,22 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
+use windows::Win32::Graphics::GdiPlus::{
+    FontStyleRegular, GdipCreateFont, GdipCreateFontFamilyFromName, GdipCreateFromHDC,
+    GdipCreateSolidFill, GdipCreateStringFormat, GdipDeleteBrush, GdipDeleteFont,
+    GdipDeleteFontFamily, GdipDeleteGraphics, GdipDeleteStringFormat, GdipDrawString,
+    GdipSetStringFormatAlign, GdipSetStringFormatLineAlign, GdipSetTextRenderingHint,
+    GdiplusStartup, GdiplusStartupInput, GpBrush, GpFont, GpFontFamily, GpGraphics, GpSolidFill,
+    GpStringFormat, RectF, StringAlignmentCenter, StringAlignmentNear, StringFormatFlagsNoWrap,
+    TextRenderingHintAntiAliasGridFit, UnitPixel,
+};
 use windows::Win32::System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleW};
 use windows::Win32::System::Registry::*;
 use windows::Win32::System::Threading::{CreateMutexW, WaitForSingleObject};
@@ -24,6 +33,7 @@ use crate::native_interop::{
     self, Color, TIMER_COUNTDOWN, TIMER_POLL, TIMER_RESET_POLL, TIMER_UPDATE_CHECK, WM_APP_TRAY,
     WM_APP_USAGE_UPDATED,
 };
+use crate::pace;
 use crate::poller;
 use crate::theme;
 use crate::tray_icon;
@@ -78,6 +88,7 @@ struct AppState {
     notified_quota_windows: BTreeSet<String>,
 
     data: Option<AppUsageData>,
+    pace_history: pace::History,
 
     poll_interval_ms: u32,
     retry_count: u32,
@@ -90,6 +101,7 @@ struct AppState {
     last_update_check_unix: Option<u64>,
 
     taskbar_index: usize,
+    taskbar_monitor_id: Option<String>,
     tray_offset: i32,
     dragging: bool,
     drag_start_mouse_x: i32,
@@ -123,6 +135,7 @@ const IDM_FREQ_1HOUR: u16 = 13;
 const IDM_START_WITH_WINDOWS: u16 = 20;
 const IDM_RESET_POSITION: u16 = 30;
 const IDM_VERSION_ACTION: u16 = 31;
+const IDM_PACE_DETAILS: u16 = 32;
 const IDM_LANG_SYSTEM: u16 = 40;
 const IDM_LANG_ENGLISH: u16 = 41;
 const IDM_LANG_DUTCH: u16 = 42;
@@ -144,6 +157,7 @@ const IDM_ALERT_OFF: u16 = 80;
 const IDM_ALERT_10: u16 = 81;
 const IDM_ALERT_20: u16 = 82;
 const IDM_ALERT_30: u16 = 83;
+const IDM_MONITOR_BASE: u16 = 100;
 
 const WM_DPICHANGED_MSG: u32 = 0x02E0;
 const WM_APP_UPDATE_CHECK_COMPLETE: u32 = WM_APP + 2;
@@ -157,6 +171,12 @@ static SUPPRESS_TRAY_REPOSITION_UNTIL: Mutex<Option<Instant>> = Mutex::new(None)
 
 /// Current system DPI (96 = 100% scaling, 144 = 150%, 192 = 200%, etc.)
 static CURRENT_DPI: AtomicU32 = AtomicU32::new(96);
+
+/// Set only for an intentional application close (for example, a portable
+/// self-update).  A taskbar/Explorer teardown can destroy the child window
+/// without sending WM_CLOSE; that case must remain alive for the watchdog to
+/// relaunch a fresh embedded instance.
+static EXIT_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 /// Scale a base pixel value (designed at 96 DPI) to the current DPI.
 fn sc(px: i32) -> i32 {
@@ -247,21 +267,62 @@ fn relaunch_self() {
 fn spawn_taskbar_watchdog() {
     std::thread::spawn(move || loop {
         std::thread::sleep(Duration::from_secs(TASKBAR_WATCH_INTERVAL_SECS));
-        let stored = {
+        let (stored, desired_monitor_id, hwnd) = {
             let state = lock_state();
-            state.as_ref().and_then(|s| s.taskbar_hwnd)
+            state
+                .as_ref()
+                .map(|s| {
+                    (
+                        s.taskbar_hwnd,
+                        s.taskbar_monitor_id.clone(),
+                        s.hwnd.to_hwnd(),
+                    )
+                })
+                .unwrap_or((None, None, HWND::default()))
         };
         // Only relevant once we have embedded into a taskbar at least once.
         let Some(old) = stored else {
             continue;
         };
+        // The taskbar can destroy an embedded child during display/power
+        // reconfiguration while leaving the old taskbar handle unchanged.
+        // Check our own HWND as well as the taskbar HWND so the watchdog does
+        // not miss that case.
+        let own_window_gone = unsafe { !IsWindow(hwnd).as_bool() };
         let taskbars = native_interop::find_taskbars();
-        if !taskbars.is_empty() && !taskbars.iter().any(|taskbar| taskbar.hwnd == old) {
-            let new = taskbars[0].hwnd;
-            diagnose::log(format!(
-                "watchdog: taskbar changed old={:?} new={:?} -> relaunching",
-                old.0, new.0
-            ));
+        let taskbar_changed =
+            !taskbars.is_empty() && !taskbars.iter().any(|taskbar| taskbar.hwnd == old);
+        let current_monitor_id = taskbars
+            .iter()
+            .find(|taskbar| taskbar.hwnd == old)
+            .map(|taskbar| taskbar.monitor_id.as_str());
+        let preferred_monitor_returned = preferred_monitor_returned(
+            desired_monitor_id.as_deref(),
+            current_monitor_id,
+            taskbars.iter().any(|taskbar| {
+                desired_monitor_id
+                    .as_deref()
+                    .is_some_and(|desired| taskbar.monitor_id == desired)
+            }),
+        );
+        if own_window_gone || taskbar_changed || preferred_monitor_returned {
+            if own_window_gone {
+                diagnose::log(format!(
+                    "watchdog: embedded window destroyed hwnd={:?} taskbar={:?} -> relaunching",
+                    hwnd.0, old.0
+                ));
+            } else if preferred_monitor_returned {
+                diagnose::log(format!(
+                    "watchdog: preferred monitor returned id={:?} current_taskbar={:?} -> relaunching",
+                    desired_monitor_id, old.0
+                ));
+            } else {
+                let new = taskbars[0].hwnd;
+                diagnose::log(format!(
+                    "watchdog: taskbar changed old={:?} new={:?} -> relaunching",
+                    old.0, new.0
+                ));
+            }
             relaunch_self();
         }
     });
@@ -296,6 +357,10 @@ fn load_embedded_app_icons() -> (HICON, HICON) {
 unsafe impl Send for AppState {}
 
 static STATE: Mutex<Option<AppState>> = Mutex::new(None);
+/// Identities displayed in the open monitor submenu. WM_COMMAND resolves
+/// through this snapshot so a transient enumeration reorder cannot select a
+/// different monitor than the one the user clicked.
+static MONITOR_MENU_IDS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 /// Lock STATE safely, recovering from poisoned mutex
 fn lock_state() -> MutexGuard<'static, Option<AppState>> {
@@ -322,8 +387,10 @@ fn legacy_settings_path() -> PathBuf {
 struct SettingsFile {
     #[serde(default)]
     tray_offset: i32,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     taskbar_index: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    taskbar_monitor_id: Option<String>,
     #[serde(default = "default_poll_interval")]
     poll_interval_ms: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -353,6 +420,7 @@ impl Default for SettingsFile {
         Self {
             tray_offset: 0,
             taskbar_index: 0,
+            taskbar_monitor_id: None,
             poll_interval_ms: default_poll_interval(),
             language: None,
             last_update_check_unix: None,
@@ -477,6 +545,7 @@ fn save_state_settings() {
         save_settings(&SettingsFile {
             tray_offset: s.tray_offset,
             taskbar_index: s.taskbar_index,
+            taskbar_monitor_id: s.taskbar_monitor_id.clone(),
             poll_interval_ms: s.poll_interval_ms,
             language: s
                 .language_override
@@ -772,18 +841,65 @@ fn toggle_widget_visibility(hwnd: HWND) {
     }
 }
 
-fn attach_to_taskbar(hwnd: HWND, requested_index: usize) -> bool {
+fn choose_taskbar_index(
+    monitor_ids: &[&str],
+    requested_monitor_id: Option<&str>,
+    requested_index: usize,
+) -> (usize, bool) {
+    if let Some(requested_monitor_id) = requested_monitor_id {
+        if let Some(index) = monitor_ids
+            .iter()
+            .position(|monitor_id| *monitor_id == requested_monitor_id)
+        {
+            return (index, true);
+        }
+    }
+    (
+        requested_index.min(monitor_ids.len().saturating_sub(1)),
+        false,
+    )
+}
+
+fn preferred_monitor_returned(
+    desired_monitor_id: Option<&str>,
+    current_monitor_id: Option<&str>,
+    desired_is_available: bool,
+) -> bool {
+    desired_is_available && desired_monitor_id.is_some() && current_monitor_id != desired_monitor_id
+}
+
+fn attach_to_taskbar(
+    hwnd: HWND,
+    requested_monitor_id: Option<&str>,
+    requested_index: usize,
+) -> bool {
     let taskbars = native_interop::find_taskbars();
     if taskbars.is_empty() {
         diagnose::log("taskbar not found; using fallback popup window");
         return false;
     }
 
-    let index = requested_index.min(taskbars.len().saturating_sub(1));
-    let taskbar = taskbars[index];
+    let monitor_ids: Vec<&str> = taskbars
+        .iter()
+        .map(|taskbar| taskbar.monitor_id.as_str())
+        .collect();
+    let (index, matched_monitor) =
+        choose_taskbar_index(&monitor_ids, requested_monitor_id, requested_index);
+    let taskbar = taskbars[index].clone();
+    if requested_monitor_id.is_some() && !matched_monitor {
+        diagnose::log(format!(
+            "saved monitor identity unavailable; using temporary fallback index={index} id={}",
+            taskbar.monitor_id
+        ));
+    }
     diagnose::log(format!(
-        "taskbar selected index={index} count={} hwnd={:?} rect=({}, {}, {}, {})",
+        "taskbar selected index={index} count={} monitor_id={} display_name={} display_name_source={} device={} primary={} hwnd={:?} rect=({}, {}, {}, {})",
         taskbars.len(),
+        taskbar.monitor_id,
+        taskbar.display_name,
+        taskbar.display_name_source,
+        taskbar.device_name,
+        taskbar.is_primary,
         taskbar.hwnd,
         taskbar.rect.left,
         taskbar.rect.top,
@@ -824,6 +940,12 @@ fn attach_to_taskbar(hwnd: HWND, requested_index: usize) -> bool {
         s.tray_notify_hwnd = tray_notify;
         s.win_event_hook = hook;
         s.taskbar_index = index;
+        if requested_monitor_id.is_none() {
+            // A legacy index is migrated only after it resolves to an actual
+            // monitor. A temporary fallback for a missing saved identity must
+            // never replace the user's choice.
+            s.taskbar_monitor_id = Some(taskbar.monitor_id.clone());
+        }
         s.embedded = true;
     }
     true
@@ -889,6 +1011,9 @@ fn auto_update_check_due(last_update_check_unix: Option<u64>) -> bool {
 }
 
 fn schedule_auto_update_check(hwnd: HWND) {
+    if !updater::UPDATES_ENABLED {
+        return;
+    }
     let delay_ms = {
         let state = lock_state();
         let Some(s) = state.as_ref() else {
@@ -990,6 +1115,44 @@ fn set_window_title(hwnd: HWND, strings: Strings) {
     }
 }
 
+fn pace_details() -> String {
+    let state = lock_state();
+    let Some(s) = state.as_ref() else {
+        return "--".into();
+    };
+    let ja = s.language == LanguageId::Japanese;
+    if !s.last_poll_ok {
+        return if ja {
+            "使用量を取得できていないため、ペース判定は保留中です。"
+        } else {
+            "Waiting for a successful usage refresh."
+        }
+        .into();
+    }
+    let Some(codex) = s.data.as_ref().and_then(|data| data.codex.as_ref()) else {
+        return if ja {
+            "Codexの使用量がありません。"
+        } else {
+            "No Codex usage available."
+        }
+        .into();
+    };
+    let assessment = s.pace_history.weekly(&codex.weekly, SystemTime::now());
+    let budget = assessment
+        .budget_per_day
+        .map(|n| format!("{n:.1}"))
+        .unwrap_or_else(|| "--".into());
+    let recent = assessment
+        .recent_per_day
+        .map(|n| format!("{n:.1}"))
+        .unwrap_or_else(|| "--".into());
+    if ja {
+        format!("7d 計画の目安\nこれから使える量：1日 {budget} ポイント\n最近の消費：1日 {recent} ポイント\n\n1ポイント＝残量100％→99％の消費です。\n直近最大3日（未使用の時間も含む）の平均と比較します。\n履歴24時間未満・リセット日時不明の場合、予測は保留します。\n\n5h：残り時間の割合に対して残量が少ないと黄色、75％未満で赤。\n7d：最近の消費が1日の目安を超えると黄色、1.25倍を超えると赤。\n通常色は安全の保証ではありません。利用予定によって結果は変わります。")
+    } else {
+        format!("7d planning guide\nAvailable budget: {budget} percentage points/day\nRecent consumption: {recent} points/day\n\nBased on up to 3 days, including idle time.\nPrediction needs 24 hours of history and a known reset time.\n\n5h: yellow below proportional remaining quota; red below 75% of it.\n7d: yellow above daily budget; red above 1.25 times budget.\nNormal color is not a guarantee; future usage can change.")
+    }
+}
+
 fn show_info_message(hwnd: HWND, title: &str, message: &str) {
     unsafe {
         let title_wide = native_interop::wide_str(title);
@@ -1088,6 +1251,12 @@ fn version_action_label(
 }
 
 fn begin_update_check(hwnd: HWND, interactive: bool) {
+    if !updater::UPDATES_ENABLED {
+        if interactive {
+            show_info_message(hwnd, "Codex Usage", "このビルドでは自動更新を利用できません。\nAutomatic updates are unavailable in this build.");
+        }
+        return;
+    }
     let send_hwnd = SendHwnd::from_hwnd(hwnd);
     let (strings, install_channel) = {
         let mut state = lock_state();
@@ -1411,12 +1580,12 @@ const SEGMENT_H: i32 = 13;
 const SEGMENT_GAP: i32 = 1;
 const SEGMENT_COUNT: i32 = 10;
 
-const LEFT_DIVIDER_W: i32 = 3;
+const LEFT_DIVIDER_W: i32 = 34; // Service logo also serves as the drag handle.
 const DIVIDER_RIGHT_MARGIN: i32 = 10;
 const LABEL_WIDTH: i32 = 18;
 const LABEL_RIGHT_MARGIN: i32 = 10;
 const BAR_RIGHT_MARGIN: i32 = 4;
-const TEXT_WIDTH: i32 = 62;
+const TEXT_WIDTH: i32 = 100;
 const SIMPLIFIED_CHINESE_LABEL_WIDTH: i32 = 20;
 const SIMPLIFIED_CHINESE_TEXT_WIDTH: i32 = 126;
 const MODEL_RIGHT_MARGIN: i32 = 3;
@@ -1465,12 +1634,8 @@ fn usage_layout_widths(language: LanguageId) -> (i32, i32) {
     }
 }
 
-fn usage_percent_for_display(language: LanguageId, used_percentage: f64) -> f64 {
-    if language == LanguageId::SimplifiedChinese {
-        poller::remaining_percentage(used_percentage)
-    } else {
-        used_percentage.clamp(0.0, 100.0)
-    }
+fn usage_percent_for_display(_language: LanguageId, used_percentage: f64) -> f64 {
+    poller::remaining_percentage(used_percentage)
 }
 
 fn total_widget_width_for(active_models: i32, language: LanguageId) -> i32 {
@@ -1568,7 +1733,14 @@ pub fn run() {
     // Exception: when relaunched after an explorer restart (ENV_RELAUNCH set),
     // wait for the previous instance to release the mutex, then take over.
     let is_relaunch = std::env::var(ENV_RELAUNCH).is_ok();
-    let mutex_name = native_interop::wide_str("Global\\CodexUsage");
+    // Keep the opt-in font experiment runnable beside the normal instance so
+    // the prototype can be visually compared without replacing the user's
+    // running application.
+    let mutex_name = native_interop::wide_str(if gdiplus_text_enabled() {
+        "Global\\CodexUsageFontTest"
+    } else {
+        "Global\\CodexUsage"
+    });
     let _mutex = unsafe {
         let handle = CreateMutexW(None, true, PCWSTR::from_raw(mutex_name.as_ptr()));
         match handle {
@@ -1710,6 +1882,7 @@ pub fn run() {
                 alert_threshold_percent: settings.alert_threshold_percent,
                 notified_quota_windows: settings.notified_quota_windows.into_iter().collect(),
                 data: None,
+                pace_history: pace::History::load(),
                 poll_interval_ms: settings.poll_interval_ms,
                 retry_count: 0,
                 force_notify_auth_error: false,
@@ -1720,6 +1893,7 @@ pub fn run() {
                 update_status: UpdateStatus::Idle,
                 last_update_check_unix: settings.last_update_check_unix,
                 taskbar_index: settings.taskbar_index,
+                taskbar_monitor_id: settings.taskbar_monitor_id.clone(),
                 tray_offset: settings.tray_offset,
                 dragging: false,
                 drag_start_mouse_x: 0,
@@ -1730,8 +1904,15 @@ pub fn run() {
         }
 
         // Try to embed in taskbar
-        if attach_to_taskbar(hwnd, settings.taskbar_index) {
+        if attach_to_taskbar(
+            hwnd,
+            settings.taskbar_monitor_id.as_deref(),
+            settings.taskbar_index,
+        ) {
             embedded = true;
+            // This persists a legacy-index migration, but a missing saved
+            // identity remains unchanged during temporary fallback.
+            save_state_settings();
         }
 
         // If not embedded, fall back to topmost popup with SetLayeredWindowAttributes
@@ -1890,7 +2071,7 @@ fn render_layered() {
         Color::from_hex("#AAAAAA")
     };
     let text_color = if is_dark {
-        Color::from_hex("#888888")
+        Color::from_hex("#F5F5F5")
     } else {
         Color::from_hex("#404040")
     };
@@ -2011,6 +2192,161 @@ fn render_layered() {
     }
 }
 
+static GDIPLUS_READY: OnceLock<bool> = OnceLock::new();
+static LOGGED_FONT_FAMILIES: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
+static ICON_LOAD_LOGGED: OnceLock<bool> = OnceLock::new();
+
+fn contains_cjk_text(text: &str) -> bool {
+    text.chars().any(|character| {
+        matches!(
+            character as u32,
+            0x3000..=0x30FF
+                | 0x3400..=0x4DBF
+                | 0x4E00..=0x9FFF
+                | 0xAC00..=0xD7AF
+                | 0xF900..=0xFAFF
+        )
+    })
+}
+
+fn font_family_candidates(text: &str) -> &'static [&'static str] {
+    if contains_cjk_text(text) {
+        &["Yu Gothic UI", "Meiryo UI", "Segoe UI"]
+    } else {
+        &["Segoe UI Variable", "Segoe UI"]
+    }
+}
+
+fn gdiplus_text_enabled() -> bool {
+    std::env::var("CODEX_USAGE_TEXT_RENDERER")
+        .map(|value| value.eq_ignore_ascii_case("gdiplus"))
+        .unwrap_or(false)
+}
+
+fn gdiplus_ready() -> bool {
+    *GDIPLUS_READY.get_or_init(|| unsafe {
+        let mut input = GdiplusStartupInput::default();
+        input.GdiplusVersion = 1;
+        let mut token = 0usize;
+        let ready = GdiplusStartup(&mut token, &input, std::ptr::null_mut()).0 == 0;
+        diagnose::log(if ready {
+            "font test renderer initialized: GDI+ AntiAliasGridFit"
+        } else {
+            "font test renderer unavailable: GDI+ startup failed"
+        });
+        ready
+    })
+}
+
+/// Draw one widget text run with the opt-in GDI+ anti-aliased experiment.
+/// Returning false keeps the existing GDI DrawTextW path as the fallback.
+fn draw_widget_text(
+    hdc: HDC,
+    text: &str,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+    color: Color,
+) -> bool {
+    if !gdiplus_text_enabled() || !gdiplus_ready() {
+        return false;
+    }
+
+    unsafe {
+        let mut graphics: *mut GpGraphics = std::ptr::null_mut();
+        if GdipCreateFromHDC(hdc, &mut graphics).0 != 0 {
+            return false;
+        }
+        let mut family: *mut GpFontFamily = std::ptr::null_mut();
+        let selected_family = font_family_candidates(text).iter().find(|family_name| {
+            let family_name_wide = native_interop::wide_str(family_name);
+            GdipCreateFontFamilyFromName(
+                PCWSTR::from_raw(family_name_wide.as_ptr()),
+                std::ptr::null_mut(),
+                &mut family,
+            )
+            .0 == 0
+        });
+        let Some(selected_family) = selected_family else {
+            let _ = GdipDeleteGraphics(graphics);
+            return false;
+        };
+        let logged_families = LOGGED_FONT_FAMILIES.get_or_init(|| Mutex::new(BTreeSet::new()));
+        let mut logged_families = logged_families
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if logged_families.insert((*selected_family).to_string()) {
+            diagnose::log(format!(
+                "font test family selected: {} cjk={}",
+                selected_family,
+                contains_cjk_text(text)
+            ));
+        }
+
+        let mut font: *mut GpFont = std::ptr::null_mut();
+        if GdipCreateFont(
+            family,
+            sc(12) as f32,
+            FontStyleRegular.0,
+            UnitPixel,
+            &mut font,
+        )
+        .0 != 0
+        {
+            let _ = GdipDeleteFontFamily(family);
+            let _ = GdipDeleteGraphics(graphics);
+            return false;
+        }
+
+        let mut brush: *mut GpSolidFill = std::ptr::null_mut();
+        let argb =
+            0xFF00_0000u32 | ((color.r as u32) << 16) | ((color.g as u32) << 8) | color.b as u32;
+        if GdipCreateSolidFill(argb, &mut brush).0 != 0 {
+            let _ = GdipDeleteFont(font);
+            let _ = GdipDeleteFontFamily(family);
+            let _ = GdipDeleteGraphics(graphics);
+            return false;
+        }
+
+        let mut format: *mut GpStringFormat = std::ptr::null_mut();
+        if GdipCreateStringFormat(StringFormatFlagsNoWrap.0, 0, &mut format).0 != 0 {
+            let _ = GdipDeleteBrush(brush as *mut GpBrush);
+            let _ = GdipDeleteFont(font);
+            let _ = GdipDeleteFontFamily(family);
+            let _ = GdipDeleteGraphics(graphics);
+            return false;
+        }
+
+        let _ = GdipSetStringFormatAlign(format, StringAlignmentNear);
+        let _ = GdipSetStringFormatLineAlign(format, StringAlignmentCenter);
+        let _ = GdipSetTextRenderingHint(graphics, TextRenderingHintAntiAliasGridFit);
+        let text_wide = native_interop::wide_str(text);
+        let rect = RectF {
+            X: x as f32,
+            Y: y as f32,
+            Width: width as f32,
+            Height: height as f32,
+        };
+        let status = GdipDrawString(
+            graphics,
+            PCWSTR::from_raw(text_wide.as_ptr()),
+            text.encode_utf16().count() as i32,
+            font,
+            &rect,
+            format,
+            brush as *const GpBrush,
+        );
+
+        let _ = GdipDeleteStringFormat(format);
+        let _ = GdipDeleteBrush(brush as *mut GpBrush);
+        let _ = GdipDeleteFont(font);
+        let _ = GdipDeleteFontFamily(family);
+        let _ = GdipDeleteGraphics(graphics);
+        status.0 == 0
+    }
+}
+
 /// Paint all widget content onto a DC with a given background color.
 fn paint_content(
     hdc: HDC,
@@ -2043,6 +2379,22 @@ fn paint_content(
     codex_accent: &Color,
     antigravity_accent: &Color,
 ) {
+    let (session_level, weekly_level) = {
+        let state = lock_state();
+        state
+            .as_ref()
+            .filter(|s| s.last_poll_ok)
+            .and_then(|s| {
+                s.data.as_ref()?.codex.as_ref().map(|data| {
+                    let now = SystemTime::now();
+                    (
+                        pace::five_hour(&data.session, now),
+                        s.pace_history.weekly(&data.weekly, now).level,
+                    )
+                })
+            })
+            .unwrap_or_default()
+    };
     unsafe {
         let session_pct = usage_percent_for_display(language, session_pct);
         let weekly_pct = usage_percent_for_display(language, weekly_pct);
@@ -2063,42 +2415,39 @@ fn paint_content(
         FillRect(hdc, &client_rect, bg_brush);
         let _ = DeleteObject(bg_brush);
 
-        // Left divider
-        let divider_h = sc(25);
-        let divider_top = (height - divider_h) / 2;
-        let divider_bottom = divider_top + divider_h;
-
-        let (div_left, div_right) = if is_dark {
-            ((80, 80, 80), (40, 40, 40))
+        // Single-image ICO assets: the PNG icon resource follows the 22-byte header.
+        let icon_bytes: &[u8] = if is_dark {
+            include_bytes!("icons/chatgpt-blossom-white.ico")
         } else {
-            ((160, 160, 160), (230, 230, 230))
+            include_bytes!("icons/chatgpt-blossom-dark.ico")
         };
-
-        let left_brush = CreateSolidBrush(COLORREF(native_interop::colorref(
-            div_left.0, div_left.1, div_left.2,
-        )));
-        let left_rect = RECT {
-            left: 0,
-            top: divider_top,
-            right: sc(2),
-            bottom: divider_bottom,
-        };
-        FillRect(hdc, &left_rect, left_brush);
-        let _ = DeleteObject(left_brush);
-
-        let right_brush = CreateSolidBrush(COLORREF(native_interop::colorref(
-            div_right.0,
-            div_right.1,
-            div_right.2,
-        )));
-        let right_rect = RECT {
-            left: sc(2),
-            top: divider_top,
-            right: sc(3),
-            bottom: divider_bottom,
-        };
-        FillRect(hdc, &right_rect, right_brush);
-        let _ = DeleteObject(right_brush);
+        let icon_size = sc(28);
+        if let Ok(icon) = CreateIconFromResourceEx(
+            &icon_bytes[22..],
+            true,
+            0x00030000,
+            icon_size,
+            icon_size,
+            LR_DEFAULTCOLOR,
+        ) {
+            let _ = DrawIconEx(
+                hdc,
+                sc(3),
+                (height - icon_size) / 2,
+                icon,
+                icon_size,
+                icon_size,
+                0,
+                HBRUSH::default(),
+                DI_NORMAL,
+            );
+            if ICON_LOAD_LOGGED.set(true).is_ok() {
+                diagnose::log("ChatGPT Blossom taskbar icon loaded");
+            }
+            let _ = DestroyIcon(icon);
+        } else if ICON_LOAD_LOGGED.set(false).is_ok() {
+            diagnose::log("ChatGPT Blossom taskbar icon failed to load");
+        }
 
         let content_x = sc(LEFT_DIVIDER_W) + sc(DIVIDER_RIGHT_MARGIN);
         let row2_y = height - sc(5) - sc(SEGMENT_H);
@@ -2108,13 +2457,13 @@ fn paint_content(
         let _ = SetBkMode(hdc, TRANSPARENT);
         let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
 
-        let font_name = native_interop::wide_str("Segoe UI");
+        let font_name = native_interop::wide_str("Yu Gothic UI");
         let font = CreateFontW(
             sc(-12),
             0,
             0,
             0,
-            FW_MEDIUM.0 as i32,
+            FW_NORMAL.0 as i32,
             0,
             0,
             0,
@@ -2143,6 +2492,7 @@ fn paint_content(
                 session_text,
                 codex_session_pct,
                 codex_session_text,
+                session_level,
                 antigravity_session_pct,
                 antigravity_session_text,
                 show_claude_code,
@@ -2172,6 +2522,7 @@ fn paint_content(
                 weekly_text,
                 codex_weekly_pct,
                 codex_weekly_text,
+                weekly_level,
                 antigravity_weekly_pct,
                 antigravity_weekly_text,
                 show_claude_code,
@@ -2271,6 +2622,9 @@ fn do_poll(send_hwnd: SendHwnd) {
                 }
 
                 quota_alerts = collect_low_quota_alerts(s, &data);
+                if let Some(codex) = data.codex.as_ref() {
+                    s.pace_history.record(&codex.weekly, SystemTime::now());
+                }
                 s.data = Some(data);
                 s.last_poll_ok = true;
                 refresh_usage_texts(s);
@@ -2721,6 +3075,17 @@ unsafe extern "system" fn wnd_proc(
         }
         WM_ERASEBKGND => LRESULT(1),
         WM_DISPLAYCHANGE | WM_DPICHANGED_MSG | WM_SETTINGCHANGE => {
+            if diagnose::is_enabled() {
+                let label = match msg {
+                    WM_DISPLAYCHANGE => "WM_DISPLAYCHANGE",
+                    WM_DPICHANGED_MSG => "WM_DPICHANGED",
+                    _ => "WM_SETTINGCHANGE",
+                };
+                diagnose::log(format!(
+                    "display/settings message {label} wparam={:?}",
+                    wparam.0
+                ));
+            }
             if msg == WM_DPICHANGED_MSG {
                 let new_dpi = (wparam.0 & 0xFFFF) as u32;
                 CURRENT_DPI.store(new_dpi, Ordering::Relaxed);
@@ -2733,6 +3098,15 @@ unsafe extern "system" fn wnd_proc(
             position_at_taskbar();
             render_layered();
             LRESULT(0)
+        }
+        WM_POWERBROADCAST => {
+            diagnose::log(format!(
+                "power message WM_POWERBROADCAST wparam={:?}",
+                wparam.0
+            ));
+            position_at_taskbar();
+            render_layered();
+            LRESULT(1)
         }
         WM_TIMER => {
             let timer_id = wparam.0;
@@ -2982,7 +3356,7 @@ unsafe extern "system" fn wnd_proc(
                                 s.tray_offset = new_offset;
                             }
                         }
-                        if attach_to_taskbar(hwnd, target_index) {
+                        if attach_to_taskbar(hwnd, None, target_index) {
                             position_at_taskbar();
                             render_layered();
                         }
@@ -3015,6 +3389,10 @@ unsafe extern "system" fn wnd_proc(
                     std::thread::spawn(move || {
                         do_poll(sh);
                     });
+                }
+                IDM_PACE_DETAILS => {
+                    let message = pace_details();
+                    show_info_message(hwnd, "Codex Usage — Pace", &message);
                 }
                 IDM_VERSION_ACTION => {
                     let (install_channel, release) = {
@@ -3067,6 +3445,34 @@ unsafe extern "system" fn wnd_proc(
                     }
                     save_state_settings();
                     position_at_taskbar();
+                }
+                id if (IDM_MONITOR_BASE..IDM_MONITOR_BASE + 16).contains(&id) => {
+                    let menu_index = (id - IDM_MONITOR_BASE) as usize;
+                    let target_monitor_id = MONITOR_MENU_IDS
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .get(menu_index)
+                        .cloned();
+                    let target_monitor_id =
+                        native_interop::find_taskbars().into_iter().find(|taskbar| {
+                            target_monitor_id
+                                .as_deref()
+                                .is_some_and(|id| taskbar.monitor_id == id)
+                        });
+                    if let Some(target_monitor) = target_monitor_id {
+                        let target_monitor_id = target_monitor.monitor_id.clone();
+                        {
+                            let mut state = lock_state();
+                            if let Some(s) = state.as_mut() {
+                                s.taskbar_monitor_id = Some(target_monitor_id.clone());
+                            }
+                        }
+                        if attach_to_taskbar(hwnd, Some(&target_monitor_id), 0) {
+                            save_state_settings();
+                            position_at_taskbar();
+                            render_layered();
+                        }
+                    }
                 }
                 IDM_START_WITH_WINDOWS => {
                     set_startup_enabled(!is_startup_enabled());
@@ -3238,6 +3644,11 @@ unsafe extern "system" fn wnd_proc(
             }
             LRESULT(0)
         }
+        WM_CLOSE => {
+            EXIT_REQUESTED.store(true, Ordering::Relaxed);
+            let _ = DestroyWindow(hwnd);
+            LRESULT(0)
+        }
         WM_DESTROY => {
             let hook = {
                 let state = lock_state();
@@ -3247,7 +3658,15 @@ unsafe extern "system" fn wnd_proc(
                 native_interop::unhook_win_event(h);
             }
             tray_icon::remove_all(hwnd);
-            PostQuitMessage(0);
+            let embedded = {
+                let state = lock_state();
+                state.as_ref().map(|s| s.embedded).unwrap_or(false)
+            };
+            if EXIT_REQUESTED.load(Ordering::Relaxed) || !embedded {
+                PostQuitMessage(0);
+            } else {
+                diagnose::log("embedded window destroyed externally; watchdog remains active");
+            }
             LRESULT(0)
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
@@ -3271,6 +3690,7 @@ fn show_context_menu(hwnd: HWND) {
             show_session_window,
             show_weekly_window,
             alert_threshold_percent,
+            taskbar_monitor_id,
         ) = {
             let state = lock_state();
             match state.as_ref() {
@@ -3289,6 +3709,7 @@ fn show_context_menu(hwnd: HWND) {
                     s.show_session_window,
                     s.show_weekly_window,
                     s.alert_threshold_percent,
+                    s.taskbar_monitor_id.clone(),
                 ),
                 None => (
                     POLL_15_MIN,
@@ -3305,11 +3726,24 @@ fn show_context_menu(hwnd: HWND) {
                     true,
                     true,
                     0,
+                    None,
                 ),
             }
         };
 
         let menu = CreatePopupMenu().unwrap();
+
+        let pace_label = native_interop::wide_str(if language == LanguageId::Japanese {
+            "消費ペース・1日の目安"
+        } else {
+            "Consumption pace / daily budget"
+        });
+        let _ = AppendMenuW(
+            menu,
+            MENU_ITEM_FLAGS(0),
+            IDM_PACE_DETAILS as usize,
+            PCWSTR::from_raw(pace_label.as_ptr()),
+        );
 
         let refresh_str = native_interop::wide_str(strings.refresh);
         let _ = AppendMenuW(
@@ -3539,6 +3973,63 @@ fn show_context_menu(hwnd: HWND) {
             PCWSTR::from_raw(reset_pos_str.as_ptr()),
         );
 
+        let monitor_menu = CreatePopupMenu().unwrap();
+        let taskbars = native_interop::find_taskbars();
+        {
+            let mut menu_ids = MONITOR_MENU_IDS
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            *menu_ids = taskbars
+                .iter()
+                .map(|taskbar| taskbar.monitor_id.clone())
+                .collect();
+        }
+        for (index, taskbar) in taskbars.iter().enumerate() {
+            let label = native_interop::wide_str(&format!(
+                "{} ({})",
+                taskbar.display_name,
+                taskbar.device_name.trim_start_matches("\\\\.\\")
+            ));
+            let _ = AppendMenuW(
+                monitor_menu,
+                MENU_ITEM_FLAGS(0),
+                (IDM_MONITOR_BASE + index as u16) as usize,
+                PCWSTR::from_raw(label.as_ptr()),
+            );
+        }
+        if let Some(selected_index) = taskbars.iter().position(|taskbar| {
+            taskbar_monitor_id
+                .as_deref()
+                .is_some_and(|id| id == taskbar.monitor_id)
+        }) {
+            let _ = CheckMenuRadioItem(
+                monitor_menu,
+                IDM_MONITOR_BASE as u32,
+                (IDM_MONITOR_BASE + taskbars.len() as u16 - 1) as u32,
+                (IDM_MONITOR_BASE + selected_index as u16) as u32,
+                MF_BYCOMMAND.0,
+            );
+        }
+        if taskbars.is_empty() {
+            let label = native_interop::wide_str(if language == LanguageId::Japanese {
+                "モニターが見つかりません"
+            } else {
+                "No monitors found"
+            });
+            let _ = AppendMenuW(monitor_menu, MF_GRAYED, 0, PCWSTR::from_raw(label.as_ptr()));
+        }
+        let monitor_label = native_interop::wide_str(if language == LanguageId::Japanese {
+            "表示モニター"
+        } else {
+            "Display monitor"
+        });
+        let _ = AppendMenuW(
+            settings_menu,
+            MF_POPUP,
+            monitor_menu.0 as usize,
+            PCWSTR::from_raw(monitor_label.as_ptr()),
+        );
+
         let language_menu = CreatePopupMenu().unwrap();
         let system_label = native_interop::wide_str(strings.system_default);
         let system_flags = if language_override.is_none() {
@@ -3709,7 +4200,7 @@ fn paint(hdc: HDC, hwnd: HWND) {
         Color::from_hex("#AAAAAA")
     };
     let text_color = if is_dark {
-        Color::from_hex("#888888")
+        Color::from_hex("#F5F5F5")
     } else {
         Color::from_hex("#404040")
     };
@@ -3784,6 +4275,7 @@ fn draw_row(
     claude_text: &str,
     codex_percent: f64,
     codex_text: &str,
+    codex_level: pace::Level,
     antigravity_percent: f64,
     antigravity_text: &str,
     show_claude_code: bool,
@@ -3805,7 +4297,7 @@ fn draw_row(
     } else {
         *text_color
     };
-    let codex_value_color = if use_model_text_colors {
+    let mut codex_value_color = if use_model_text_colors {
         codex_usage_text_color(is_dark)
     } else {
         *text_color
@@ -3815,22 +4307,34 @@ fn draw_row(
     } else {
         *text_color
     };
+    let warning_color = match codex_level {
+        pace::Level::Normal => None,
+        pace::Level::Caution => Some(Color::from_hex(if is_dark { "#F2CC60" } else { "#916900" })),
+        pace::Level::Warning => Some(Color::from_hex(if is_dark { "#FF8585" } else { "#B42318" })),
+    };
+    if let Some(color) = warning_color {
+        codex_value_color = color;
+    }
+    let codex_accent = warning_color.as_ref().unwrap_or(codex_accent);
 
     unsafe {
-        let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
-        let mut label_wide: Vec<u16> = label.encode_utf16().collect();
-        let mut label_rect = RECT {
-            left: x,
-            top: y,
-            right: x + sc(label_width),
-            bottom: y + seg_h,
-        };
-        let _ = DrawTextW(
-            hdc,
-            &mut label_wide,
-            &mut label_rect,
-            DT_LEFT | DT_VCENTER | DT_SINGLELINE,
-        );
+        let label_width_px = sc(label_width);
+        if !draw_widget_text(hdc, label, x, y, label_width_px, seg_h, *text_color) {
+            let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
+            let mut label_wide: Vec<u16> = label.encode_utf16().collect();
+            let mut label_rect = RECT {
+                left: x,
+                top: y,
+                right: x + label_width_px,
+                bottom: y + seg_h,
+            };
+            let _ = DrawTextW(
+                hdc,
+                &mut label_wide,
+                &mut label_rect,
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE,
+            );
+        }
 
         let mut model_x = x + sc(label_width) + sc(LABEL_RIGHT_MARGIN);
         if show_claude_code {
@@ -3905,7 +4409,12 @@ fn draw_usage_bar(
     let corner_r = seg_h / 2;
 
     unsafe {
-        let percent_clamped = percent.clamp(0.0, 100.0);
+        // Loading/error labels have no percentage; don't imply a full battery.
+        let percent_clamped = if text.contains('%') {
+            percent.clamp(0.0, 100.0)
+        } else {
+            0.0
+        };
         let bar_rect = RECT {
             left: bar_x,
             top: y,
@@ -3939,20 +4448,23 @@ fn draw_usage_bar(
         }
 
         let text_x = bar_x + bar_width + sc(BAR_RIGHT_MARGIN);
-        let mut text_wide: Vec<u16> = text.encode_utf16().collect();
-        let mut text_rect = RECT {
-            left: text_x,
-            top: y,
-            right: text_x + sc(text_width),
-            bottom: y + seg_h,
-        };
-        let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
-        let _ = DrawTextW(
-            hdc,
-            &mut text_wide,
-            &mut text_rect,
-            DT_LEFT | DT_VCENTER | DT_SINGLELINE,
-        );
+        let text_width_px = sc(text_width);
+        if !draw_widget_text(hdc, text, text_x, y, text_width_px, seg_h, *text_color) {
+            let mut text_wide: Vec<u16> = text.encode_utf16().collect();
+            let mut text_rect = RECT {
+                left: text_x,
+                top: y,
+                right: text_x + text_width_px,
+                bottom: y + seg_h,
+            };
+            let _ = SetTextColor(hdc, COLORREF(text_color.to_colorref()));
+            let _ = DrawTextW(
+                hdc,
+                &mut text_wide,
+                &mut text_rect,
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE,
+            );
+        }
     }
 }
 
@@ -3976,6 +4488,42 @@ fn draw_rounded_rect(hdc: HDC, rect: &RECT, color: &Color, radius: i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn widget_gauge_and_text_both_show_remaining() {
+        for language in [
+            LanguageId::Japanese,
+            LanguageId::English,
+            LanguageId::SimplifiedChinese,
+        ] {
+            for (used, remaining) in [(0.0, 100.0), (25.0, 75.0), (100.0, 0.0)] {
+                assert_eq!(usage_percent_for_display(language, used), remaining);
+                let section = crate::models::UsageSection {
+                    percentage: used,
+                    resets_at: None,
+                };
+                let text = poller::format_line(
+                    &section,
+                    language.strings(),
+                    language == LanguageId::SimplifiedChinese,
+                    poller::UsageWindowKind::Session,
+                );
+                assert!(text.contains(&format!("{remaining:.0}%")));
+            }
+        }
+    }
+
+    #[test]
+    fn cjk_text_prefers_japanese_ui_families() {
+        assert_eq!(
+            font_family_candidates("5h 42%"),
+            &["Segoe UI Variable", "Segoe UI"]
+        );
+        assert_eq!(
+            font_family_candidates("5時間 42%"),
+            &["Yu Gothic UI", "Meiryo UI", "Segoe UI"]
+        );
+    }
 
     #[test]
     fn service_tooltip_combines_visible_quota_rows() {
@@ -4009,6 +4557,42 @@ mod tests {
             claude_code_menu_label(LanguageId::English.strings(), LanguageId::English, true),
             "Claude Code"
         );
+    }
+
+    #[test]
+    fn monitor_selection_survives_taskbar_enumeration_reorder() {
+        let ids = ["MONITOR-B", "MONITOR-A"];
+        assert_eq!(choose_taskbar_index(&ids, Some("MONITOR-A"), 0), (1, true));
+    }
+
+    #[test]
+    fn missing_saved_monitor_uses_fallback_without_matching_it() {
+        let ids = ["MONITOR-A"];
+        assert_eq!(choose_taskbar_index(&ids, Some("MONITOR-B"), 0), (0, false));
+        let returned_ids = ["MONITOR-A", "MONITOR-B"];
+        assert_eq!(
+            choose_taskbar_index(&returned_ids, Some("MONITOR-B"), 0),
+            (1, true)
+        );
+    }
+
+    #[test]
+    fn watchdog_relaunches_when_preferred_monitor_returns() {
+        assert!(preferred_monitor_returned(
+            Some("MONITOR-B"),
+            Some("MONITOR-A"),
+            true
+        ));
+        assert!(!preferred_monitor_returned(
+            Some("MONITOR-B"),
+            Some("MONITOR-A"),
+            false
+        ));
+        assert!(!preferred_monitor_returned(
+            Some("MONITOR-B"),
+            Some("MONITOR-B"),
+            true
+        ));
     }
 
     fn test_settings_json(language: &str) -> String {

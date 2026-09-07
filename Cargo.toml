@@ -1,20 +1,20 @@
 [package]
 name = "codex-usage"
-version = "1.9.1"
+version = "1.10.0"
 edition = "2021"
 license = "MIT"
 description = "Codex Usage"
-homepage = "https://github.com/upstream-ray/codex-usage-monitor"
-repository = "https://github.com/upstream-ray/codex-usage-monitor"
+homepage = "https://github.com/riyonasan/codex-usage-monitor"
+repository = "https://github.com/riyonasan/codex-usage-monitor"
 
 [package.metadata.winres]
-CompanyName = "Ray"
+CompanyName = "riyonasan"
 ProductName = "Codex Usage"
 FileDescription = "Lightweight Codex usage monitor for Windows"
 OriginalFilename = "codex-usage.exe"
 InternalName = "CodexUsage"
 Comments = "Derived from Claude Code Usage Monitor under the MIT License"
-LegalCopyright = "Original copyright (C) 2026 Code Zeno Pty Ltd; modifications (C) 2026 Ray"
+LegalCopyright = "Original copyright (C) 2026 Code Zeno Pty Ltd; modifications (C) 2026 Ray, riyonasan"
 
 [dependencies]
 ureq = { version = "2", default-features = false, features = ["native-tls", "json", "proxy-from-env"] }
@@ -28,8 +28,10 @@ sha2 = "0.10"
 version = "0.58"
 features = [
     "Win32_Foundation",
+    "Win32_Devices_Display",
     "Win32_Globalization",
     "Win32_Graphics_Gdi",
+    "Win32_Graphics_GdiPlus",
     "Win32_System_LibraryLoader",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",

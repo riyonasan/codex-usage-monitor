@@ -11,7 +11,7 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-$Repository = 'upstream-ray/codex-usage-monitor'
+$Repository = 'riyonasan/codex-usage-monitor'
 $InstallDirectory = Join-Path $env:LOCALAPPDATA 'Programs\CodexUsage'
 $TargetPath = Join-Path $InstallDirectory 'codex-usage.exe'
 $InstalledUninstaller = Join-Path $InstallDirectory 'uninstall.ps1'
@@ -140,7 +140,7 @@ try {
         $UninstallCommand = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$InstalledUninstaller`""
         Set-ItemProperty -Path $UninstallKey -Name DisplayName -Value 'Codex Usage'
         Set-ItemProperty -Path $UninstallKey -Name DisplayVersion -Value $InstalledVersion
-        Set-ItemProperty -Path $UninstallKey -Name Publisher -Value 'Ray'
+        Set-ItemProperty -Path $UninstallKey -Name Publisher -Value 'riyonasan'
         Set-ItemProperty -Path $UninstallKey -Name DisplayIcon -Value $TargetPath
         Set-ItemProperty -Path $UninstallKey -Name InstallLocation -Value $InstallDirectory
         Set-ItemProperty -Path $UninstallKey -Name URLInfoAbout -Value "https://github.com/$Repository"

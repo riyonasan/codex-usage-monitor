@@ -50,7 +50,7 @@ Antigravity 也是可选功能。若要显示其用量，请安装并登录 Goog
 
 ## 安装
 
-如需按用户安装，请从[最新版本](https://github.com/upstream-ray/codex-usage-monitor/releases/latest)下载 `install.ps1`，然后运行：
+如需按用户安装，请从[最新版本](https://github.com/riyonasan/codex-usage-monitor/releases/latest)下载 `install.ps1`，然后运行：
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install.ps1

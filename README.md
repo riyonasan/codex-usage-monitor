@@ -1,221 +1,112 @@
+# Codex Usage Monitor
+
+Windowsのタスクバーに、Codexの5時間枠・週次枠の残量とリセットまでの時間を常時表示する軽量モニターです。
+
 ![Windows](https://img.shields.io/badge/platform-Windows-blue)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-**English** | [简体中文](README.zh-CN.md)
+> [!IMPORTANT]
+> 非公式のコミュニティ製アプリです。OpenAIによる提供、承認、提携を受けた製品ではありません。
 
-# Codex Usage
+## 特長
 
-<img src=".github/codex-usage-icon.png" alt="Codex Usage icon" width="96" height="96">
+- 5時間枠と7日枠をタスクバー内に2行で常時表示
+- ゲージと数値は使用量ではなく、バッテリー表示のように残量（100 − 使用量％）を表示
+- 各枠のリセットまでの残り時間を表示
+- Windowsの表示言語に合わせた自動言語選択（日本語を含む）
+- 複数モニターから表示先を選択し、画面復帰後も選択したモニターを維持
+- 最近の消費ペースを基に、使い切る可能性が高い場合はゲージ色で警告
+- 定期更新、手動更新、Windows起動時の自動起動
+- 管理者権限、ブラウザのCookie、独自のログイン操作は不要
 
 ![Screenshot](.github/animation.gif)
 
-A lightweight native Windows taskbar widget for monitoring Codex usage, with optional Claude Code and Google Antigravity usage display.
+## 必要環境
 
-It sits in your taskbar and shows how much of your Codex usage window remains without opening the Codex app or account usage page.
+- Windows 10またはWindows 11
+- Codex CLIまたはCodexアプリがインストール済みで、サインイン済みであること
 
-## What You Get
+本アプリはCodexがローカルに保存している既存の認証情報を利用してOpenAIから使用量を取得します。認証情報を独自に保存したり、OpenAI以外の独自サーバーへ送信したりしません。
 
-- A **5h** bar for your current Codex usage window
-- A **7d** bar for your current weekly window
-- Simplified Chinese display with explicit remaining usage and reset countdowns
-- Optional Claude Code usage alongside Codex
-- Optional Antigravity model usage bars for Google's 5-hour and weekly Gemini quota windows
-- A live countdown until each limit resets
-- Optional low-quota alerts at 10%, 20%, or 30% remaining, deduplicated per reset window
-- Independent display controls for the 5-hour and weekly rows
-- A small native widget that lives directly in the Windows taskbar
-- One system tray icon that matches the desktop app icon
-- Left-click the tray icon to toggle the taskbar widget on or off
-- Right-click options for refresh, monitored services, usage rows, quota alerts, update frequency, language, startup, widget visibility, and updates
-- Multi-monitor taskbar placement, so the widget can live on the taskbar for the screen you prefer
+## インストール
 
-## Who This Is For
+### インストーラーを使う
 
-This app is for Windows users who already have **Codex CLI or the Codex app installed and signed in**.
-
-Codex is enabled by default. The app reads the same local credentials used by Codex.
-
-Antigravity support is optional too. To show Antigravity usage, install and sign in to Google Antigravity, then enable the **Antigravity** service from the right-click **Monitored services** menu.
-
-It works best if you want a simple "how close am I to the limit?" display that is always visible.
-
-## Requirements
-
-- Windows 10 or Windows 11
-- Codex CLI or Codex app installed and authenticated
-- Optional: Claude Code installed and authenticated
-- Optional: Google Antigravity installed and authenticated, if you want Antigravity usage
-
-If you use Claude Code through WSL, that is supported too. The monitor can read your Claude Code credentials from Windows or from your WSL environment.
-
-## Install
-
-For a per-user installation, download `install.ps1` from the [latest release](https://github.com/upstream-ray/codex-usage-monitor/releases/latest), then run:
+[最新のRelease](https://github.com/riyonasan/codex-usage-monitor/releases/latest)から `install.ps1` をダウンロードし、PowerShellで実行します。
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install.ps1
 ```
 
-The installer verifies the release SHA256 and installs to `%LOCALAPPDATA%\Programs\CodexUsage` without administrator access. It adds a Start menu shortcut and an entry in Windows Installed Apps.
+`%LOCALAPPDATA%\Programs\CodexUsage` にユーザー単位でインストールされ、スタートメニューと「インストールされているアプリ」に登録されます。管理者権限は不要です。
 
-For portable use, download `codex-usage.exe` from the same release and run it from any user-writable directory. You can also build it locally:
+### ポータブル版を使う
+
+[最新のRelease](https://github.com/riyonasan/codex-usage-monitor/releases/latest)から `codex-usage.exe` をダウンロードし、任意の書き込み可能なフォルダーから起動します。
+
+Releaseには改ざん確認用の `codex-usage.exe.sha256` も添付されます。
+
+## 操作
+
+通知領域のアイコンを右クリックすると、更新、表示するサービスや行、更新間隔、言語、表示モニター、自動起動などを設定できます。左クリックではタスクバー表示の表示・非表示を切り替えます。
+
+### 消費ペースの目安
+
+- 5h：リセットまでの時間に対して残量が少ない場合、黄色または赤で警告します。
+- 7d：残量とリセットまでの日数から1日あたりの予算を求め、最近の実消費が予算を超える場合に警告します。
+- 最初の24時間は履歴不足のため予測せず、通常色で表示します。
+- 右クリックの「消費ペース・1日の目安」から詳細を確認できます。
+
+履歴は `%LOCALAPPDATA%\CodexUsage\pace-history.json` に日時、使用率、リセット日時だけを保存します。認証情報は含みません。
+
+## 更新
+
+GitHub Releasesを使用して更新を確認します。ポータブル版と本インストーラー版は、このリポジトリのReleaseから更新されます。上流版のWinGetパッケージとは別系統です。
+
+## アンインストール
+
+Windowsの「設定」→「アプリ」→「インストールされているアプリ」から **Codex Usage** をアンインストールできます。
+
+設定も削除する場合は次を実行します。
 
 ```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\Programs\CodexUsage\uninstall.ps1" -RemoveSettings
+```
+
+## ビルド
+
+[Rust](https://www.rust-lang.org/tools/install)を導入したWindows環境で実行します。
+
+```powershell
+cargo test
 cargo build --release
 ```
 
-Local builds create the executable at `target\release\codex-usage.exe`.
+ビルド結果は `target\release\codex-usage.exe` に生成されます。
 
-## Uninstall
+## 公開Releaseの作成
 
-Uninstall **Codex Usage** from Windows Settings > Apps > Installed apps, or run:
+バージョンを更新して `v` で始まるタグ（例: `v1.10.0`）をpushすると、GitHub ActionsがWindows版exeをビルドし、exe、SHA256、インストール・アンインストールスクリプト、ライセンス類をReleaseへ添付します。
 
-```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\Programs\CodexUsage\uninstall.ps1"
-```
+## プライバシーとセキュリティ
 
-Uninstalling preserves `%APPDATA%\CodexUsage\settings.json`. Add `-RemoveSettings` to delete settings explicitly. See [Installation model](docs/installation.md) for upgrade, portable, startup, and WinGet behavior.
+- Codexの既存認証情報を使用し、独自の認証情報は保存しません。
+- 認証トークン、Cookie、Authorizationヘッダーをログへ出力しません。
+- ブラウザスクレイピングやテレメトリーは使用しません。
+- アップデート時はReleaseに添付されたSHA256を検証します。
 
-## Use
+## 上流プロジェクトとライセンス
 
-Run:
+このプロジェクトは [upstream-ray/codex-usage-monitor](https://github.com/upstream-ray/codex-usage-monitor) を基にした派生版です。元プロジェクトおよび本プロジェクトのコードは[MIT License](LICENSE)で公開されています。
 
-```powershell
-codex-usage
-```
+OpenAIおよびBlossomロゴはOpenAIの商標です。詳細は [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) と [OpenAI Brand Guidelines](https://openai.com/brand/) を参照してください。
 
-Once running, it will appear in your taskbar and as one tray icon in the notification area.
+## 既知の制約
 
-- Drag the left divider to move the taskbar widget
-- On multi-monitor setups, drag the widget onto another Windows taskbar to move it to that screen
-- Right-click the taskbar widget or tray icon for refresh, monitored services, usage rows, quota alerts, update frequency, Start with Windows, reset position, language, updates, and exit
-- Left-click the tray icon to toggle the taskbar widget on or off
-- Enable `Start with Windows` from the right-click menu if you want it to launch automatically when you sign in
+- Codex側の非公開APIや認証保存形式が変更された場合、使用量を取得できなくなる可能性があります。
+- Windowsのタスクバー構成やExplorerの更新によっては、表示位置の再調整が必要になる場合があります。
+- 取得できない利用枠は0%ではなく、利用不可として扱います。
 
-### Monitored Services
+---
 
-Use the right-click **Monitored services** menu to choose which independent services the widget displays. The services are not mutually exclusive, so you can monitor more than one account at the same time:
-
-- **Codex** is enabled by default
-- **Claude Code** can be enabled alongside Codex or shown by itself when Claude Code CLI is installed and authenticated
-- **Antigravity** can be enabled alongside the other providers or shown by itself as its own service column
-
-When multiple services are shown, each service has its own usage bar and matching usage text color. Antigravity prefers Google's Gemini quota summary when available and falls back to model quota data when needed.
-
-Claude Desktop and Claude Code CLI use separate local sessions. Signing in to Claude Desktop does not enable Claude Code monitoring. When no supported Claude Code CLI credentials are available, the menu shows **Claude Code (CLI login required)** as a disabled item and automatically keeps that service off.
-
-### System Tray Icon
-
-The app always shows one tray icon using the same embedded icon as the executable and desktop shortcut, regardless of how many services are enabled.
-
-Hovering over the tray icon shows a compact summary for all enabled services. Left-clicking it toggles the taskbar widget; right-clicking it opens the settings menu.
-
-### Usage Display And Alerts
-
-Use the right-click **Usage display** menu to show both quota rows or only one. The app always keeps at least one row visible.
-
-Use **Quota alerts** to choose a remaining-quota threshold of 10%, 20%, or 30%. Alerts are off by default. Each provider and quota window is notified only once until its reset time changes, including across app restarts.
-
-In Simplified Chinese, the compact taskbar rows use `5h` / `7d`, one continuous progress bar, remaining percentage, and a concrete local reset value such as `18:30重置` or `07/17重置`.
-
-## Diagnostics
-
-If you need to troubleshoot startup or visibility issues, run:
-
-```powershell
-codex-usage --diagnose
-```
-
-This writes a log file to:
-
-```text
-%TEMP%\codex-usage.log
-```
-
-The log records the application version, install channel, executable path, polling failure category, and retry timing. It does not log access tokens or credential contents. See [Troubleshooting](docs/troubleshooting.md) for the taskbar error labels and recovery steps.
-
-Settings are saved to:
-
-```text
-%APPDATA%\CodexUsage\settings.json
-```
-
-## Account Support
-
-Codex usage is read from the account authenticated in the local Codex installation. Optional Claude Code monitoring works with the account types supported by Claude Code.
-
-As of **March 19, 2026**, Anthropic's Claude Code setup documentation says:
-
-- **Supported:** Pro, Max, Teams, Enterprise, and Console accounts
-- **Not supported:** the free Claude.ai plan
-
-If Anthropic changes Claude Code availability in the future, this app should follow whatever Claude Code supports, as long as the usage data remains exposed through the same authenticated endpoints.
-
-## Privacy And Security
-
-This project is **open source**, so you can inspect exactly what it does.
-
-What the app reads:
-
-- Your local Claude Code OAuth credentials from `~/.claude/.credentials.json`
-- If `CLAUDE_CONFIG_DIR` is set, the Claude Code credentials file in that directory
-- If needed, the same credentials file inside an installed WSL distro
-- If Codex is enabled, your local Codex credentials from `$CODEX_HOME/auth.json` or `~/.codex/auth.json`
-- If Antigravity is enabled, your local Antigravity OAuth token from Windows Credential Manager target `gemini:antigravity`
-
-What the app sends over the network:
-
-- Requests to Anthropic's Claude endpoints to read your usage and rate-limit information
-- Requests to ChatGPT's Codex usage endpoint to read your Codex usage and rate-limit information, if Codex is enabled
-- Requests to Google's Cloud Code / Antigravity endpoints to read your Antigravity quota information, if Antigravity is enabled
-- Requests to GitHub only if you use the app's update check / self-update feature
-- If proxy environment variables such as `HTTPS_PROXY`, `HTTP_PROXY`, or `ALL_PROXY` are set, those outbound requests may use that proxy
-
-What the app stores locally:
-
-- Widget position
-- Selected taskbar / screen
-- Widget visibility
-- Polling frequency
-- Language preference
-- Last update check time
-- Visible quota rows and low-quota alert threshold
-- Quota-window notification keys used to prevent duplicate alerts
-- Displayed model preferences
-
-What it does **not** do:
-
-- It does not send your credentials to any other server
-- It does not use a separate backend service
-- It does not collect analytics or telemetry
-- It does not upload your project files
-- It does not directly edit your Codex credentials file
-- It does not read or reuse Claude Desktop authentication data
-
-Notes:
-
-- If your Claude Code token is expired, the app may ask the local Claude CLI to refresh it in the background
-- If your Codex token is expired, the app may ask the local Codex CLI to refresh it in the background. The monitor does not write `auth.json` itself; any credential update is handled by the Codex CLI.
-- If your Antigravity token is expired, open Antigravity and sign in again. The monitor does not write Windows Credential Manager entries itself.
-- Portable installs can update themselves by downloading the latest release from this repository
-- Proxies should be trusted because proxied usage requests include your OAuth bearer token inside the TLS connection
-
-## How It Works
-
-The monitor:
-
-1. Finds your enabled model login credentials
-2. Reads your current usage from Anthropic, ChatGPT, and/or Google's Antigravity endpoints
-3. Shows the result directly in the Windows taskbar
-4. Keeps the widget aligned with the selected taskbar and tray area
-5. Refreshes periodically in the background
-
-If the newer usage endpoint is unavailable, it can fall back to reading the rate-limit headers returned by Claude's Messages API.
-
-## Open Source
-
-This project is licensed under the MIT License. The original [LICENSE](LICENSE) and copyright notice are preserved.
-
-Codex Usage is a maintained derivative of [CodeZeno/Claude-Code-Usage-Monitor](https://github.com/CodeZeno/Claude-Code-Usage-Monitor). Thanks to Craig Constable and the upstream contributors for the original project. Changes in this repository are not affiliated with or endorsed by the upstream maintainers or OpenAI.
-
-If you want to inspect the behavior or audit the code, everything is in this repository.
+簡体字中国語版は [README.zh-CN.md](README.zh-CN.md) を参照してください。

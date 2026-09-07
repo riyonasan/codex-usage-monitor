@@ -74,12 +74,24 @@ pub fn handle_cli_mode(args: &[String]) -> Option<i32> {
 
 pub fn current_install_channel() -> InstallChannel {
     match std::env::current_exe() {
-        Ok(path) if is_winget_install_path(&path) => InstallChannel::Winget,
+        // Fork releases use their own GitHub assets, never the upstream WinGet package.
+        Ok(path)
+            if env!("CARGO_PKG_REPOSITORY")
+                == "https://github.com/upstream-ray/codex-usage-monitor"
+                && is_winget_install_path(&path) =>
+        {
+            InstallChannel::Winget
+        }
         _ => InstallChannel::Portable,
     }
 }
 
+pub const UPDATES_ENABLED: bool = true;
+
 pub fn check_for_updates() -> Result<UpdateCheckResult, String> {
+    if !UPDATES_ENABLED {
+        return Err("Automatic updates are unavailable in this build.".into());
+    }
     match fetch_latest_release()? {
         Some(release) => Ok(UpdateCheckResult::Available(release)),
         None => Ok(UpdateCheckResult::UpToDate),
@@ -598,6 +610,15 @@ fn wide_str(value: &str) -> Vec<u16> {
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn updates_target_public_repository() {
+        assert_eq!(
+            github_repo().unwrap(),
+            ("riyonasan", "codex-usage-monitor")
+        );
+        assert_eq!(current_install_channel(), InstallChannel::Portable);
+    }
 
     fn test_directory(name: &str) -> PathBuf {
         let unique = SystemTime::now()
