@@ -161,6 +161,7 @@ const IDM_MONITOR_BASE: u16 = 100;
 
 const WM_DPICHANGED_MSG: u32 = 0x02E0;
 const WM_APP_UPDATE_CHECK_COMPLETE: u32 = WM_APP + 2;
+const WM_APP_RESTORE_TASKBAR_ORDER: u32 = WM_APP + 3;
 const TRAY_ICON_UPDATE_REPOSITION_SUPPRESS_MS: u64 = 750;
 
 /// How often the watchdog thread polls for an explorer.exe restart (which
@@ -324,6 +325,12 @@ fn spawn_taskbar_watchdog() {
                 ));
             }
             relaunch_self();
+        } else {
+            // Display recovery can reorder surviving taskbar children later
+            // than the power/display message. Reuse the existing watchdog.
+            unsafe {
+                let _ = PostMessageW(hwnd, WM_APP_RESTORE_TASKBAR_ORDER, WPARAM(0), LPARAM(0));
+            }
         }
     });
 }
@@ -2909,6 +2916,28 @@ fn tray_reposition_is_suppressed() -> bool {
     }
 }
 
+fn restore_taskbar_order() {
+    let target = {
+        let state = lock_state();
+        state.as_ref().filter(|s| s.embedded && s.widget_visible)
+            .and_then(|s| s.taskbar_hwnd.map(|parent| (s.hwnd.to_hwnd(), parent)))
+    };
+    if let Some((hwnd, parent)) = target {
+        unsafe {
+            if GetParent(hwnd).ok() == Some(parent)
+                && GetWindow(hwnd, GW_HWNDPREV).is_ok_and(|previous| !previous.is_invalid())
+            {
+                // HWND_TOP only reorders siblings; never raise the taskbar itself.
+                if SetWindowPos(hwnd, HWND_TOP, 0, 0, 0, 0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER).is_err()
+                {
+                    diagnose::log("unable to restore taskbar child order");
+                }
+            }
+        }
+    }
+}
+
 fn position_at_taskbar() {
     refresh_dpi();
     // Drop the app-state lock before any Win32 call that may synchronously
@@ -2981,6 +3010,7 @@ fn position_at_taskbar() {
         // Child window: coordinates relative to parent (taskbar)
         let x = tray_left - taskbar_rect.left - widget_width - tray_offset;
         native_interop::move_window(hwnd, x, y - taskbar_rect.top, widget_width, widget_height);
+        restore_taskbar_order();
         diagnose::log(format!(
             "positioned embedded widget at x={x} y={} w={widget_width} h={widget_height}",
             y - taskbar_rect.top
@@ -3054,6 +3084,10 @@ unsafe extern "system" fn wnd_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     match msg {
+        WM_APP_RESTORE_TASKBAR_ORDER => {
+            restore_taskbar_order();
+            LRESULT(0)
+        }
         WM_PAINT => {
             // For non-embedded fallback, paint normally
             let embedded = {
